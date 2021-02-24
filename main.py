@@ -6,6 +6,7 @@ import os
 import requests
 import functools
 import dns.resolver
+import dns.exception
 import operator
 import logging
 
@@ -13,9 +14,10 @@ import logging
 DnsResponse = namedtuple('DnsResponse', ['ipv4', 'expiry', 'response_time'])
 HostConfiguration = namedtuple('HostConfiguration', ['name', 'webhook_uri'])
 
+
 def _load_configuration(path):
     with open(path, 'r') as f:
-        data = yaml.load(f)
+        data = yaml.safe_load(f)
 
     return {k: HostConfiguration(v['name'], v['webhook_uri']) for k, v in data.items()}
 
@@ -23,7 +25,7 @@ def _load_configuration(path):
 def _load_response_cache(path):
     try:
         with open(path, 'r') as f:
-            cache = yaml.load(f)
+            cache = yaml.safe_load(f)
 
         if cache is None:
             return {}
@@ -45,26 +47,25 @@ def _save_response_cache(path, responses):
 def _is_response_stale(responses, host):
     response = responses.get(host)
 
-    if response is None:
-        return True
-
-    return response.expiry < time.time()
+    return response is None or response.expiry < time.time()
 
 
 def _notify_webhook(host, host_config, response):
     content = f'IP address for **{host_config.name}** ({host}) is now **{response.ipv4}**'
 
-    requests.post(
+    resp = requests.post(
         host_config.webhook_uri,
         headers={'Content-Type': 'application/json'},
         json={'content': content}
     )
 
+    logging.debug(f'Received HTTP response from WebHook API: {resp}')
+
 
 def _check_dns(host):
     logging.debug(f'Retrieving A record for {host}')
 
-    answers = dns.resolver.query(host, 'A')
+    answers = dns.resolver.resolve(host, 'A')
 
     answer = answers[0]
 
@@ -90,14 +91,23 @@ def main():
         stale_hosts = filter(stale_check_predicate, config.keys())
 
         for stale_host in stale_hosts:
-            response = _check_dns(stale_host)
-
             old_response = responses.get(stale_host)
+
+            try:
+                response = _check_dns(stale_host)
+            except dns.exception.DNSException as e:
+                logging.exception(f'Exception occurred executing DNS query for {stale_host}', e)
+                continue
 
             if old_response is None or old_response.ipv4 != response.ipv4:
                 old_ipv4 = None if old_response is None else old_response.ipv4
                 logging.info(f'{stale_host} IP address changed to {response.ipv4} from {old_ipv4}')
-                _notify_webhook(stale_host, config[stale_host], response)
+
+                try:
+                    _notify_webhook(stale_host, config[stale_host], response)
+                except requests.exceptions.RequestException as e:
+                    logging.exception(f'Exception occurred executing WebHook API HTTP request', e)
+                    continue
 
             responses[stale_host] = response
             _save_response_cache(response_cache_path, responses)
